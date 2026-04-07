@@ -1,87 +1,27 @@
--- Schéma CQL — à compléter (repères TODO ci-dessous)
---
--- ATTENTION : tant que vous n’avez pas ajouté vos propres instructions CQL NON COMMENTÉES
--- (CREATE KEYSPACE, USE, CREATE TABLE…), « cqlsh < ce_fichier » ne crée rien dans Cassandra.
--- Les modèles ci-dessous sont commentés : à recopier ou adapter en code actif.
---
--- Règle : PRIMARY KEY ((partition), clustering…) = ce que vous mettrez dans WHERE en lecture.
--- Pas de JOIN en production : une table par besoin de requête (tableau de bord).
+CREATE KEYSPACE IF NOT EXISTS elections
+WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
 
--- =============================================================================
--- TODO 1 : Keyspace
--- =============================================================================
--- Copie conforme attendue :
--- CREATE KEYSPACE IF NOT EXISTS elections
--- WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
---
--- SimpleStrategy = suffisant en local Docker (un seul DC).
---
--- À compléter : votre CREATE KEYSPACE (non commenté).
+USE elections;
 
--- =============================================================================
--- TODO 2 : USE
--- =============================================================================
--- USE elections;
---
--- À compléter : instruction USE pour travailler dans le keyspace elections.
+CREATE TABLE IF NOT EXISTS votes_by_city_minute (
+    city_code text,
+    minute_bucket text,
+    candidate_id text,
+    votes_count bigint,
+    PRIMARY KEY ((city_code), minute_bucket, candidate_id)
+) WITH CLUSTERING ORDER BY (minute_bucket DESC, candidate_id ASC);
 
--- =============================================================================
--- TODO 3 : votes_by_city_minute
--- =============================================================================
--- Lecture cible : « historique par commune, par minute, par candidat »
--- Partition = city_code (un WHERE city_code = '…' par requête).
--- Clustering : minute_bucket (souvent texte epoch ms ou ISO), candidate_id.
---
--- Modèle :
--- CREATE TABLE IF NOT EXISTS votes_by_city_minute (
---   city_code text,
---   minute_bucket text,
---   candidate_id text,
---   votes_count bigint,
---   PRIMARY KEY ((city_code), minute_bucket, candidate_id)
--- ) WITH CLUSTERING ORDER BY (minute_bucket DESC, candidate_id ASC);
---
--- Colonnes à remplir depuis le chargeur : alignées sur les agrégats ksqlDB (ville, fenêtre, candidat, count).
---
--- À compléter : votre CREATE TABLE votes_by_city_minute (partition sur city_code).
+CREATE TABLE IF NOT EXISTS votes_by_candidate_city (
+    candidate_id text,
+    city_code text,
+    minute_bucket text,
+    votes_count bigint,
+    PRIMARY KEY ((candidate_id), city_code, minute_bucket)
+) WITH CLUSTERING ORDER BY (city_code ASC, minute_bucket DESC);
 
--- =============================================================================
--- TODO 4 : votes_by_candidate_city
--- =============================================================================
--- Lecture cible : « pour un candidat, répartition par ville et temps »
--- Partition = candidate_id.
---
--- Modèle :
--- CREATE TABLE IF NOT EXISTS votes_by_candidate_city (
---   candidate_id text,
---   city_code text,
---   minute_bucket text,
---   votes_count bigint,
---   PRIMARY KEY ((candidate_id), city_code, minute_bucket)
--- ) WITH CLUSTERING ORDER BY (city_code ASC, minute_bucket DESC);
---
--- À compléter : votre CREATE TABLE votes_by_candidate_city (partition sur candidate_id).
-
--- =============================================================================
--- TODO 5 : votes_by_department_block
--- =============================================================================
--- Lecture cible : carte / agrégat par département et bloc politique
--- Partition = department_code, clustering = block.
---
--- Modèle :
--- CREATE TABLE IF NOT EXISTS votes_by_department_block (
---   department_code text,
---   block text,
---   votes_count bigint,
---   PRIMARY KEY ((department_code), block)
--- );
---
--- À compléter : votre CREATE TABLE votes_by_department_block (partition sur department_code).
-
--- =============================================================================
--- TODO 6 : SELECT de test (adapter aux données générées)
--- =============================================================================
--- Exemples (décommenter / adapter les codes INSEE et dept. à vos données) :
--- SELECT * FROM elections.votes_by_city_minute WHERE city_code='75056' LIMIT 20;
--- SELECT * FROM elections.votes_by_candidate_city WHERE candidate_id='C01' LIMIT 20;
--- SELECT * FROM elections.votes_by_department_block WHERE department_code='75' LIMIT 20;
+CREATE TABLE IF NOT EXISTS votes_by_department_block (
+    department_code text,
+    block text,
+    votes_count bigint,
+    PRIMARY KEY ((department_code), block)
+);

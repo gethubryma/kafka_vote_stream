@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Validateur — topics vote_events_raw → valides / rejetés (implémentation à compléter)."""
+"""Validateur — topics vote_events_raw → valides / rejetés."""
 
+import csv
 import json
 from pathlib import Path
 
@@ -18,12 +19,12 @@ CANDIDATES_FILE = _ROOT / "data" / "candidates.csv"
 
 def load_candidate_ids() -> set[str]:
     ids = set()
-    with CANDIDATES_FILE.open("r", encoding="utf-8") as f:
-        next(f)
-        for line in f:
-            parts = line.strip().split(",")
-            if parts and parts[0]:
-                ids.add(parts[0])
+    with CANDIDATES_FILE.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            cid = str(row.get("candidate_id", "")).strip()
+            if cid:
+                ids.add(cid)
     return ids
 
 
@@ -38,11 +39,11 @@ def main() -> None:
         }
     )
     producer = Producer({"bootstrap.servers": BOOTSTRAP})
+
     consumer.subscribe([TOPIC_IN])
 
     stats = {"valid": 0, "rejected": 0}
     print("Validateur démarré…")
-    # Tant que les TODO 2 et 3 ne sont pas implémentés, aucun message n’est envoyé vers Kafka (normal).
 
     while True:
         msg = consumer.poll(1.0)
@@ -54,46 +55,40 @@ def main() -> None:
 
         evt = json.loads(msg.value().decode("utf-8"))
 
-        # TODO 1 — Règles dans CET ORDRE (sinon messages d’erreur incohérents)
-        #
-        # 1) Signature : rejeter si evt.get("signature_ok") is not True
-        #    (ainsi None, False, ou toute valeur non strictement True part en rejet)
-        #    Raison : "INVALID_SIGNATURE"
-        #
-        # 2) vote_id vide ou absent : not evt.get("vote_id")  -> rejet
-        #    Raison : "MISSING_VOTE_ID"
-        #
-        # 3) candidate_id pas dans le set `candidates` (chargé depuis CSV)  -> rejet
-        #    Raison : "UNKNOWN_CANDIDATE"
-        #
-        # Sinon : is_valid = True, reason = "".
-        #
-        # Astuce : construire (is_valid, reason) avec des if / elif / else pour une seule raison par message.
-        is_valid = True
-        reason = ""
+        # Ordre imposé
+        if evt.get("signature_ok") is not True:
+            is_valid = False
+            reason = "INVALID_SIGNATURE"
+        elif not evt.get("vote_id"):
+            is_valid = False
+            reason = "MISSING_VOTE_ID"
+        elif evt.get("candidate_id") not in candidates:
+            is_valid = False
+            reason = "UNKNOWN_CANDIDATE"
+        else:
+            is_valid = True
+            reason = ""
+
+        out_key = (evt.get("city_code") or "UNKNOWN").encode("utf-8")
+        out_value = json.dumps(evt, ensure_ascii=False).encode("utf-8")
 
         if is_valid:
-            # TODO 2 — Topic des valides
-            # - Clé : même principe que le producteur, bytes UTF-8 :
-            #     out_key = (evt.get("city_code") or "UNKNOWN").encode("utf-8")
-            # - Valeur : le MÊME evt (dict Python) sérialisé comme à l’entrée :
-            #     producer.produce(TOPIC_VALID, key=out_key, value=json.dumps(evt, ensure_ascii=False).encode("utf-8"))
-            # - Puis : stats["valid"] += 1
-            # - Appeler producer.flush() régulièrement (déjà fait tous les 500 messages ci-dessous).
-            pass
+            producer.produce(TOPIC_VALID, key=out_key, value=out_value)
+            stats["valid"] += 1
         else:
-            # TODO 3 — Topic des rejets
-            # 1) Ajouter la raison dans le JSON AVANT produce :
-            #      evt["error_reason"] = reason
-            # 2) Même clé que pour le valide (city_code en bytes).
-            # 3) producer.produce(TOPIC_REJECTED, key=out_key, value=json.dumps(evt, ensure_ascii=False).encode("utf-8"))
-            # 4) stats["rejected"] += 1
-            pass
+            evt["error_reason"] = reason
+            producer.produce(
+                TOPIC_REJECTED,
+                key=out_key,
+                value=json.dumps(evt, ensure_ascii=False).encode("utf-8"),
+            )
+            stats["rejected"] += 1
 
-        if (stats["valid"] + stats["rejected"]) % 500 == 0:
+        total = stats["valid"] + stats["rejected"]
+        if total % 500 == 0:
             producer.flush()
             print(
-                f"Progression total={stats['valid'] + stats['rejected']} "
+                f"Progression total={total} "
                 f"valid={stats['valid']} rejected={stats['rejected']}"
             )
 

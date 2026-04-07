@@ -1,112 +1,292 @@
 #!/usr/bin/env python3
-"""Tableau de bord Streamlit — lecture Cassandra (implémentation à compléter)."""
+"""Tableau de bord Streamlit — lecture Cassandra."""
 
-import streamlit as st
+import csv
+import json
+from pathlib import Path
+
 import pandas as pd
 import plotly.express as px
+import requests
+import streamlit as st
 from cassandra.cluster import Cluster
 
 st.set_page_config(page_title="Municipales 2026", layout="wide")
 st.title("Municipales 2026 - Dashboard France")
 
-# =============================================================================
-# TODO 1 — Connexion + lectures Cassandra
-# =============================================================================
-# 1) Cluster(["127.0.0.1"]) puis session = cluster.connect("elections")
-# 2) Exécuter des SELECT sur les 3 tables (colonnes alignées sur schema.cql) :
-#      votes_by_city_minute        -> city_code, minute_bucket, candidate_id, votes_count
-#      votes_by_candidate_city     -> candidate_id, city_code, minute_bucket, votes_count
-#      votes_by_department_block   -> department_code, block, votes_count   (peut être vide au début)
-# 3) Option KPI « votes valides / rejetés » : soit lecture des topics ksqlDB compacts VOTE_COUNT_BY_CANDIDATE
-#    et REJECTED_BY_REASON (consumer rapide), soit approximation depuis les DataFrames si vous manquez de temps.
-# 4) Si tables vides : afficher st.warning et st.stop() pour éviter des graphiques vides trompeurs.
+_ROOT = Path(__file__).resolve().parent.parent.parent
+CANDIDATES_FILE = _ROOT / "data" / "candidates.csv"
+COMMUNES_FILE = _ROOT / "data" / "communes_fr.json"
+SAMPLE_COMMUNES = _ROOT / "data" / "communes_fr_sample.json"
 
-cluster = Cluster(["127.0.0.1"])
-session = cluster.connect("elections")
 
-# =============================================================================
-# TODO 2 — DataFrames
-# =============================================================================
-# Pour chaque jeu de résultats Cassandra : listes de dicts ou boucle sur les lignes puis pd.DataFrame(...).
-# Forcer votes_count en numérique : pd.to_numeric(df["votes_count"], errors="coerce").fillna(0)
-# Si une table est vide mais l’autre non : voir sujet (repli / fallback) pour ne pas casser l’app.
+@st.cache_resource
+def get_session():
+    cluster = Cluster(["127.0.0.1"])
+    return cluster.connect("elections")
 
-df_city_minute = pd.DataFrame(
-    columns=["city_code", "minute_bucket", "candidate_id", "votes_count"]
+
+@st.cache_data
+def load_candidates_meta() -> pd.DataFrame:
+    rows = []
+    with CANDIDATES_FILE.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append(
+                {
+                    "candidate_id": str(row.get("candidate_id", "")).strip(),
+                    "candidate_name": str(row.get("candidate_name", "")).strip(),
+                    "party": str(row.get("party", "")).strip(),
+                    "block": str(row.get("political_block", "autre")).strip() or "autre",
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+@st.cache_data
+def load_communes_meta() -> pd.DataFrame:
+    source = COMMUNES_FILE if COMMUNES_FILE.exists() else SAMPLE_COMMUNES
+    if not source.exists():
+        return pd.DataFrame(columns=["city_code", "city_name", "department_code"])
+
+    data = json.loads(source.read_text(encoding="utf-8"))
+    rows = []
+    for row in data:
+        rows.append(
+            {
+                "city_code": str(row.get("code", "")).strip(),
+                "city_name": str(row.get("nom", "")).strip(),
+                "department_code": str(row.get("codeDepartement", "")).strip(),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+@st.cache_data
+def load_departements_geojson():
+    geojson_url = "https://france-geojson.gregoiredavid.fr/repo/departements.geojson"
+    response = requests.get(geojson_url, timeout=15)
+    response.raise_for_status()
+    return response.json()
+
+
+def rows_to_df(rows, columns):
+    return pd.DataFrame([dict(r._asdict()) for r in rows], columns=columns)
+
+
+session = get_session()
+
+city_rows = session.execute(
+    "SELECT city_code, minute_bucket, candidate_id, votes_count FROM votes_by_city_minute"
 )
-df_candidate_city = pd.DataFrame(
-    columns=["candidate_id", "city_code", "minute_bucket", "votes_count"]
+candidate_city_rows = session.execute(
+    "SELECT candidate_id, city_code, minute_bucket, votes_count FROM votes_by_candidate_city"
+)
+dept_rows = session.execute(
+    "SELECT department_code, block, votes_count FROM votes_by_department_block"
 )
 
-# =============================================================================
-# TODO 3 — Bloc / parti (candidates.csv)
-# =============================================================================
-# Charger data/candidates.csv : pour chaque candidate_id récupérer political_block → colonne "block"
-# et party → colonne "party" sur le DataFrame des votes (map ou merge).
-# Règle sujet : pour les graphiques PAR BLOC, ECO / écologiste est rattaché au bloc "gauche"
-# (normaliser avant groupby : si block == "ecologiste" → "gauche" pour ce graphe uniquement).
-# Ne pas mélanger les conventions « bloc » et « parti » sur un même graphique.
+df_city_minute = rows_to_df(
+    city_rows, ["city_code", "minute_bucket", "candidate_id", "votes_count"]
+)
+df_candidate_city = rows_to_df(
+    candidate_city_rows, ["candidate_id", "city_code", "minute_bucket", "votes_count"]
+)
+df_dept_block = rows_to_df(
+    dept_rows, ["department_code", "block", "votes_count"]
+)
 
-# Exemple — à remplacer par une lecture de data/candidates.csv (political_block par candidate_id).
-POLITICAL_BLOCK = {
-    "C01": "centre",
-    "C02": "gauche",
-    "C03": "droite",
-    "C04": "droite_nationale",
-    "C05": "ecologiste",
-}
+for df in (df_city_minute, df_candidate_city, df_dept_block):
+    if "votes_count" in df.columns:
+        df["votes_count"] = pd.to_numeric(df["votes_count"], errors="coerce").fillna(0)
 
-# KPI (placeholders) — remplacer par des valeurs calculées (entiers ou chaîne formatée)
+if df_city_minute.empty and df_candidate_city.empty and df_dept_block.empty:
+    st.warning("Aucune donnée dans Cassandra pour le moment. Lance d'abord ksqlDB + le chargeur Cassandra.")
+    st.stop()
+
+candidates_meta = load_candidates_meta()
+communes_meta = load_communes_meta()
+
+if not df_candidate_city.empty:
+    df_candidate_city = df_candidate_city.merge(
+        candidates_meta, on="candidate_id", how="left"
+    )
+    df_candidate_city = df_candidate_city.merge(
+        communes_meta[["city_code", "city_name", "department_code"]],
+        on="city_code",
+        how="left",
+    )
+
+if not df_city_minute.empty:
+    df_city_minute = df_city_minute.merge(
+        communes_meta[["city_code", "city_name", "department_code"]],
+        on="city_code",
+        how="left",
+    )
+    df_city_minute = df_city_minute.merge(
+        candidates_meta[["candidate_id", "candidate_name", "party", "block"]],
+        on="candidate_id",
+        how="left",
+    )
+
+if not df_candidate_city.empty:
+    df_candidate_city["block_grouped"] = df_candidate_city["block"].replace(
+        {"ecologiste": "gauche"}
+    )
+
+votes_valides = int(df_candidate_city["votes_count"].sum()) if not df_candidate_city.empty else 0
+votes_rejetes = "N/A"
+taux_rejet = "N/A"
+
+top_candidat = "N/A"
+if not df_candidate_city.empty:
+    top_candidate_df = (
+        df_candidate_city.groupby(["candidate_id", "candidate_name"], dropna=False)["votes_count"]
+        .sum()
+        .reset_index()
+        .sort_values("votes_count", ascending=False)
+    )
+    if not top_candidate_df.empty:
+        row = top_candidate_df.iloc[0]
+        name = row["candidate_name"] if pd.notna(row["candidate_name"]) and row["candidate_name"] else row["candidate_id"]
+        top_candidat = f"{name} ({int(row['votes_count'])})"
+
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("Votes valides", "TODO")
-col2.metric("Votes rejetés", "TODO")
-col3.metric("Taux rejet", "TODO")
-col4.metric("Top candidat", "TODO")
+col1.metric("Votes valides", f"{votes_valides}")
+col2.metric("Votes rejetés", votes_rejetes)
+col3.metric("Taux rejet", taux_rejet)
+col4.metric("Top candidat", top_candidat)
 
 st.subheader("Votes par bloc politique")
-# =============================================================================
-# TODO 4 — Bar chart par bloc
-# =============================================================================
-# df_candidate_city.groupby("block")["votes_count"].sum() -> reset_index
-# px.bar(..., x=nom_affiche_bloc, y=votes_count, color="block", color_discrete_map={...})
-# Légendes lisibles (extrême_gauche, gauche, …).
-
-st.info("À compléter (TODO 4) : graphique par blocs politiques")
+if not df_candidate_city.empty and "block_grouped" in df_candidate_city.columns:
+    block_df = (
+        df_candidate_city.groupby("block_grouped", dropna=False)["votes_count"]
+        .sum()
+        .reset_index()
+        .sort_values("votes_count", ascending=False)
+    )
+    fig_block = px.bar(
+        block_df,
+        x="block_grouped",
+        y="votes_count",
+        color="block_grouped",
+        title="Répartition des votes par bloc",
+    )
+    st.plotly_chart(fig_block, use_container_width=True)
+else:
+    st.info("Pas encore de données pour le graphe par bloc.")
 
 st.subheader("Votes par parti (nuance)")
-# =============================================================================
-# TODO 4bis — Bar chart par parti (nuance)
-# =============================================================================
-# groupby("party") ; couleurs par parti (ex. ECO vert) — PAS les mêmes couleurs que le graphe par bloc.
-# Deux graphiques distincts obligatoires.
-
-st.info("À compléter (TODO 4bis) : graphique par parti (nuances / couleurs)")
+if not df_candidate_city.empty and "party" in df_candidate_city.columns:
+    party_df = (
+        df_candidate_city.groupby("party", dropna=False)["votes_count"]
+        .sum()
+        .reset_index()
+        .sort_values("votes_count", ascending=False)
+    )
+    fig_party = px.bar(
+        party_df,
+        x="party",
+        y="votes_count",
+        color="party",
+        title="Répartition des votes par parti",
+    )
+    st.plotly_chart(fig_party, use_container_width=True)
+else:
+    st.info("Pas encore de données pour le graphe par parti.")
 
 st.subheader("Votes par minute")
-# =============================================================================
-# TODO 5 — Série temporelle
-# =============================================================================
-# Convertir minute_bucket : souvent epoch ms → pd.to_datetime(..., unit="ms", utc=True) puis fuseau d’affichage
-# ou parser une chaîne ISO.
-# Grouper par minute (somme votes_count), px.line(x=time, y=votes_count).
+if not df_city_minute.empty:
+    time_df = df_city_minute.copy()
+    time_df["minute_bucket_num"] = pd.to_numeric(time_df["minute_bucket"], errors="coerce")
 
-st.info("À compléter (TODO 5) : série temporelle")
+    if time_df["minute_bucket_num"].notna().any():
+        time_df["minute_dt"] = pd.to_datetime(
+            time_df["minute_bucket_num"], unit="ms", utc=True, errors="coerce"
+        )
+    else:
+        time_df["minute_dt"] = pd.to_datetime(
+            time_df["minute_bucket"], utc=True, errors="coerce"
+        )
 
-st.subheader("Carte France (votes par commune)")
-# =============================================================================
-# TODO 6 — Carte
-# =============================================================================
-# Priorité : agréger votes_by_department_block (department_code, block) pour carte dept × couleur du bloc dominant.
-# Repli si table vide : barres « top communes » depuis votes_by_city_minute + noms depuis communes_fr.json.
-# Géo : GeoJSON départements (URL publique) ou points communes si vous avez lat/lon dans le JSON.
+    time_series = (
+        time_df.groupby("minute_dt", dropna=True)["votes_count"]
+        .sum()
+        .reset_index()
+        .sort_values("minute_dt")
+    )
 
-st.info("À compléter (TODO 6) : carte France")
+    if not time_series.empty:
+        fig_time = px.line(
+            time_series,
+            x="minute_dt",
+            y="votes_count",
+            title="Votes agrégés par minute",
+        )
+        st.plotly_chart(fig_time, use_container_width=True)
+    else:
+        st.info("Horodatages non encore disponibles pour la série temporelle.")
+else:
+    st.info("Pas encore de données pour la série temporelle.")
+
+st.subheader("Carte France par département")
+if not df_dept_block.empty:
+    try:
+        dept_dom = (
+            df_dept_block.sort_values("votes_count", ascending=False)
+            .groupby("department_code", as_index=False)
+            .first()
+            .sort_values("department_code")
+            .copy()
+        )
+
+        dept_dom["department_code"] = dept_dom["department_code"].astype(str).str.zfill(2)
+
+        geojson = load_departements_geojson()
+
+        fig_map = px.choropleth(
+            dept_dom,
+            geojson=geojson,
+            locations="department_code",
+            featureidkey="properties.code",
+            color="block",
+            hover_name="department_code",
+            hover_data={"votes_count": True, "block": True},
+            title="Bloc dominant par département",
+        )
+
+        fig_map.update_geos(fitbounds="locations", visible=False)
+        st.plotly_chart(fig_map, use_container_width=True)
+    except Exception as e:
+        st.warning(f"Impossible d'afficher la carte : {e}")
+else:
+    st.info("Pas encore de données département × bloc.")
 
 st.subheader("Top communes / Top candidats")
 left, right = st.columns(2)
+
 with left:
-    # TODO 7 — Top communes : groupby city_code sur df_city_minute, tri desc, head(10), joindre le nom commune si possible
-    st.info("À compléter (TODO 7) : top communes")
+    if not df_city_minute.empty:
+        city_rank = (
+            df_city_minute.groupby(["city_code", "city_name"], dropna=False)["votes_count"]
+            .sum()
+            .reset_index()
+            .sort_values("votes_count", ascending=False)
+            .head(10)
+        )
+        st.dataframe(city_rank, use_container_width=True)
+    else:
+        st.info("Pas encore de données top communes.")
+
 with right:
-    # TODO 7 — Top candidats : groupby candidate_id, tri desc
-    st.info("À compléter (TODO 7) : top candidats")
+    if not df_candidate_city.empty:
+        cand_rank = (
+            df_candidate_city.groupby(["candidate_id", "candidate_name"], dropna=False)["votes_count"]
+            .sum()
+            .reset_index()
+            .sort_values("votes_count", ascending=False)
+            .head(10)
+        )
+        st.dataframe(cand_rank, use_container_width=True)
+    else:
+        st.info("Pas encore de données top candidats.")

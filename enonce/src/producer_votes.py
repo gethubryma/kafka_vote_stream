@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Producteur Kafka — topic vote_events_raw (implémentation à compléter selon les repères TODO)."""
+"""Producteur Kafka — topic vote_events_raw."""
 
+import csv
 import json
 import os
-import time
 import random
+import time
 import uuid
 import datetime as dt
 from pathlib import Path
@@ -13,123 +14,156 @@ from confluent_kafka import Producer
 
 BOOTSTRAP = "localhost:9092"
 TOPIC = "vote_events_raw"
+
 _ROOT = Path(__file__).resolve().parent.parent.parent
 COMMUNES_FILE = _ROOT / "data" / "communes_fr.json"
 SAMPLE_COMMUNES = _ROOT / "data" / "communes_fr_sample.json"
 CANDIDATES_FILE = _ROOT / "data" / "candidates.csv"
+
 MAX_MESSAGES = int(os.getenv("MAX_MESSAGES", "0"))  # <=0: infinite live stream
 START_DELAY_MS = float(os.getenv("START_DELAY_MS", "20"))
 
 
+def now_utc_z() -> str:
+    """Retourne une date ISO8601 UTC terminée par Z, compatible Python 3.10+."""
+    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
 def load_communes() -> list[dict]:
-    """
-    TODO 0 — Charger les communes (à implémenter)
+    """Charge les communes depuis le JSON principal ou l'échantillon."""
+    source = COMMUNES_FILE if COMMUNES_FILE.exists() else SAMPLE_COMMUNES
+    if not source.exists():
+        raise RuntimeError(
+            f"Aucun fichier communes trouvé : {COMMUNES_FILE} ou {SAMPLE_COMMUNES}"
+        )
 
-    Étapes obligatoires :
-    1) Lire le fichier JSON : priorité à COMMUNES_FILE ; s’il est absent, utiliser SAMPLE_COMMUNES.
-    2) Ouvrir en UTF-8, lire tout le texte, puis json.loads(...) sur ce contenu.
-    3) Le fichier fourni est en général une LISTE d’objets ; chaque objet a au minimum :
-         - "code" (str INSEE, ex. "75056")   → city_code
-         - "nom" (str)                       → city_name
-         - "codeDepartement" (str, ex. "75") → department_code (indispensable pour ksqlDB + carte)
-         - "codeRegion" (str)                → region_code (optionnel mais utile)
-    4) Filtrer : ne garder que les dicts où code et nom sont non vides.
-    5) Si la liste finale est vide : lever une erreur explicite (RuntimeError ou message + arrêt) —
-       sinon random.choice lèvera une erreur plus tard.
+    content = source.read_text(encoding="utf-8")
+    data = json.loads(content)
 
-    Ne pas boucler sur votes_municipales_sample.jsonl pour publier : le sujet impose le mode live (génération).
-    """
-    return []
+    if not isinstance(data, list):
+        raise RuntimeError(f"Le fichier {source} doit contenir une liste JSON.")
+
+    communes: list[dict] = []
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        code = str(row.get("code", "")).strip()
+        nom = str(row.get("nom", "")).strip()
+        if not code or not nom:
+            continue
+
+        communes.append(
+            {
+                "code": code,
+                "nom": nom,
+                "codeDepartement": str(row.get("codeDepartement", "")).strip(),
+                "codeRegion": str(row.get("codeRegion", "")).strip(),
+                "population": row.get("population", 0),
+            }
+        )
+
+    if not communes:
+        raise RuntimeError("Aucune commune exploitable n'a été chargée.")
+
+    return communes
 
 
-def build_realtime_event(communes: list[dict], sent: int) -> dict:
-    """
-    TODO 4 — Événement JSON généré à la volée (aligné validateur + ksqlDB + chargeur)
+def load_candidates() -> list[dict]:
+    """Charge les candidats depuis candidates.csv."""
+    if not CANDIDATES_FILE.exists():
+        raise RuntimeError(f"Fichier candidats introuvable : {CANDIDATES_FILE}")
 
-    Préparation :
-    - Tirer une commune : c = random.choice(communes) (vérifier que la liste n’est pas vide avant).
-    - Lire data/candidates.csv (csv ou split) pour choisir un candidate_id EXISTANT et sa colonne
-      political_block → exposer la même valeur sous la clé candidate_block dans le JSON.
+    candidates: list[dict] = []
+    with CANDIDATES_FILE.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            cid = str(row.get("candidate_id", "")).strip()
+            if not cid:
+                continue
+            candidates.append(
+                {
+                    "candidate_id": cid,
+                    "candidate_name": str(row.get("candidate_name", "")).strip(),
+                    "party": str(row.get("party", "")).strip(),
+                    "political_block": str(row.get("political_block", "autre")).strip() or "autre",
+                }
+            )
 
-    Dictionnaire à retourner (clés exactes recommandées, types JSON) :
-      vote_id            : str uuid unique (str(uuid.uuid4()))
-      election_id        : str fixe ex. "muni_2026"
-      event_time         : str ISO8601 UTC finissant par Z (maintenant UTC)
-      city_code          : str = c["code"]
-      city_name          : str = c["nom"]
-      department_code    : str = str(c.get("codeDepartement", ""))  # OBLIGATOIRE pour vote_count_by_dept_block
-      region_code        : str = str(c.get("codeRegion", ""))
-      polling_station_id : str inventé ex. "PS_001"
-      candidate_id       : str depuis le CSV
-      candidate_name     : str optionnel (colonne du CSV si présente)
-      candidate_party    : str optionnel (colonne party du CSV)
-      candidate_block    : str = political_block du CSV  # OBLIGATOIRE pour agrégat département × bloc
-      channel            : str parmi "booth" | "mobile" | "assist_terminal"
-      signature_ok       : bool True en général
-      voter_hash         : str inventé
-      ingestion_ts       : str ISO comme event_time
+    if not candidates:
+        raise RuntimeError("Aucun candidat exploitable trouvé dans candidates.csv")
 
-    Optionnel mais très utile pour le validateur / KPI rejets :
-    - Dans ~3 à 8 % des cas : signature_ok False OU candidate_id inconnu (ex. "C99") OU vote_id "".
-      Sinon rejected_by_reason restera vide et les métriques « rejets » seront fausses.
+    return candidates
 
-    Contrainte sujet : ne pas utiliser une boucle « for line in open(jsonl) » comme source principale d’envoi.
-    """
-    return {
+
+def choose_candidate(candidates: list[dict]) -> dict:
+    """Tirage simple uniforme parmi les candidats."""
+    return random.choice(candidates)
+
+
+def build_realtime_event(communes: list[dict], candidates: list[dict], sent: int) -> dict:
+    """Construit un vote temps réel."""
+    c = random.choice(communes)
+    cand = choose_candidate(candidates)
+    ts = now_utc_z()
+
+    evt = {
         "vote_id": str(uuid.uuid4()),
         "election_id": "muni_2026",
-        "event_time": dt.datetime.now(dt.UTC).isoformat().replace("+00:00", "Z"),
-        "city_code": "00000",
-        "city_name": "TODO_CITY",
-        "candidate_id": "C01",
+        "event_time": ts,
+        "city_code": str(c["code"]),
+        "city_name": str(c["nom"]),
+        "department_code": str(c.get("codeDepartement", "")),
+        "region_code": str(c.get("codeRegion", "")),
+        "polling_station_id": f"PS_{random.randint(1, 999):03d}",
+        "candidate_id": str(cand["candidate_id"]),
+        "candidate_name": str(cand.get("candidate_name", "")),
+        "candidate_party": str(cand.get("party", "")),
+        "candidate_block": str(cand.get("political_block", "autre")),
+        "channel": random.choice(["booth", "mobile", "assist_terminal"]),
         "signature_ok": True,
-        "ingestion_ts": dt.datetime.now(dt.UTC).isoformat().replace("+00:00", "Z"),
+        "voter_hash": uuid.uuid4().hex,
+        "ingestion_ts": ts,
     }
 
+    # Injecter quelques erreurs pour alimenter le flux de rejets
+    p = random.random()
+    if p < 0.03:
+        evt["signature_ok"] = False
+    elif p < 0.05:
+        evt["vote_id"] = ""
+    elif p < 0.08:
+        evt["candidate_id"] = "C99"
+        evt["candidate_name"] = "Unknown Candidate"
+        evt["candidate_party"] = ""
+        evt["candidate_block"] = "autre"
 
-# TODO 5 (avancé) — Territoire non uniforme
-#
-# Objectif : un département / une commune ne vote pas comme une autre (poids par bloc politique).
-# Piste minimale acceptable :
-#   - Construire un dict dept_code → distribution { "gauche": 0.3, "droite": 0.25, ... }, tirer un bloc,
-#     puis un candidat du CSV dont political_block correspond (après normalisation : ex. "ecologiste" → "gauche"
-#     si vous vous alignez avec le sujet carte / blocs).
-# Piste avancée : télécharger un CSV data.gouv (résultats agrégés par dept), parser, en déduire des poids.
-#
-# Sans TODO 5 : tirage uniforme parmi les candidats du CSV reste une version minimale acceptable.
+    return evt
 
 
 def main() -> None:
     producer = Producer({"bootstrap.servers": BOOTSTRAP})
+
     sent = 0
     communes = load_communes()
-    # Ordre conseillé : finir TODO 0 et TODO 4 avant de tester la boucle.
+    candidates = load_candidates()
+
+    print(f"Communes chargées : {len(communes)}")
+    print(f"Candidats chargés : {len(candidates)}")
+    print("Producteur démarré…")
 
     while True:
-        evt = build_realtime_event(communes, sent)
+        evt = build_realtime_event(communes, candidates, sent)
 
-        # TODO 1 — Clé Kafka (partitionnement)
-        # Attendu : bytes UTF-8, stable par zone ; exemple :
-        #   key = (evt.get("city_code") or "UNKNOWN").encode("utf-8")
-        # Éviter key=None si vous voulez un partitionnement prévisible par commune.
-        key = None  # à compléter
-
-        # TODO 2 — Valeur = JSON UTF-8
-        # Attendu :
-        #   value = json.dumps(evt, ensure_ascii=False).encode("utf-8")
-        # ensure_ascii=False conserve les accents ; .encode("utf-8") est requis pour confluent-kafka.
-        value = None  # à compléter
-
-        if key is None or value is None:
-            raise RuntimeError(
-                "Complétez les TODO 1 (clé Kafka en bytes UTF-8) et 2 (valeur JSON encodée en UTF-8) avant d'exécuter."
-            )
+        key = (evt.get("city_code") or "UNKNOWN").encode("utf-8")
+        value = json.dumps(evt, ensure_ascii=False).encode("utf-8")
 
         producer.produce(TOPIC, key=key, value=value)
         sent += 1
 
-        # TODO 3 (optionnel) — Rythme
-        # Après chaque message (ou chaque rafale), time.sleep(START_DELAY_MS / 1000.0) pour voir le flux dans Kafka UI.
+        if sent % 500 == 0:
+            producer.flush()
+            print(f"Envoyé {sent} message(s) sur {TOPIC}")
+
         if START_DELAY_MS > 0:
             time.sleep(START_DELAY_MS / 1000.0)
 
