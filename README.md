@@ -192,9 +192,3 @@ kafka-vote-stream/
 └── README.md
 ```
 
----
-
-## 👨‍💻 Auteur
-
-Amel
-
