@@ -1,0 +1,152 @@
+-- Requêtes ksqlDB — à compléter (repères TODO ci-dessous)
+--
+-- ATTENTION : tant que vous n’avez pas ajouté vos propres lignes CREATE STREAM / CREATE TABLE …
+-- NON COMMENTÉES, l’exécution « ksql < ce_fichier » ne crée aucun objet (SHOW STREAMS / SHOW TABLES restent vides).
+-- Les blocs ci-dessous sont des modèles à copier ou à adapter, pas du SQL exécuté tel quel.
+--
+-- Les messages sont du JSON (VALUE_FORMAT='JSON'). Les noms de champs dans CREATE STREAM
+-- doivent EXACTEMENT correspondre au JSON du producteur (sinon NULL ou échec).
+
+-- Avant les CREATE : décommenter si besoin pour rejouer depuis le début des topics
+-- SET 'auto.offset.reset'='earliest';
+
+-- =============================================================================
+-- TODO 1 : STREAM sur vote_events_valid
+-- =============================================================================
+-- Syntaxe modèle (adapter les types si le producteur envoie d'autres champs) :
+--
+-- CREATE STREAM IF NOT EXISTS vote_events_valid_stream (
+--   vote_id VARCHAR,
+--   election_id VARCHAR,
+--   event_time VARCHAR,
+--   city_code VARCHAR,
+--   department_code VARCHAR,      -- OBLIGATOIRE si TODO 6 dept x bloc
+--   polling_station_id VARCHAR,
+--   candidate_id VARCHAR,
+--   candidate_block VARCHAR,      -- OBLIGATOIRE si TODO 6 (aligné sur CSV political_block)
+--   channel VARCHAR,
+--   signature_ok BOOLEAN,
+--   voter_hash VARCHAR,
+--   ingestion_ts VARCHAR
+-- ) WITH (
+--   KAFKA_TOPIC='vote_events_valid',
+--   VALUE_FORMAT='JSON'
+-- );
+--
+-- Pièges :
+-- - Oublier department_code ou candidate_block -> table dept x bloc vide.
+-- - Mauvais nom de colonne JSON -> champ NULL en stream.
+--
+-- À compléter : votre CREATE STREAM (non commenté) pour vote_events_valid.
+
+-- =============================================================================
+-- TODO 2 : STREAM sur vote_events_rejected
+-- =============================================================================
+-- Le JSON contient error_reason (ajouté par le validateur). Exemple :
+--
+-- CREATE STREAM IF NOT EXISTS vote_events_rejected_stream (
+--   vote_id VARCHAR,
+--   election_id VARCHAR,
+--   event_time VARCHAR,
+--   city_code VARCHAR,
+--   polling_station_id VARCHAR,
+--   candidate_id VARCHAR,
+--   channel VARCHAR,
+--   signature_ok BOOLEAN,
+--   voter_hash VARCHAR,
+--   ingestion_ts VARCHAR,
+--   error_reason VARCHAR
+-- ) WITH (
+--   KAFKA_TOPIC='vote_events_rejected',
+--   VALUE_FORMAT='JSON'
+-- );
+--
+-- À compléter : votre CREATE STREAM pour vote_events_rejected.
+
+-- =============================================================================
+-- TODO 3 : TABLE comptage par candidat (flux VALIDE uniquement)
+-- =============================================================================
+-- Modèle :
+-- CREATE TABLE IF NOT EXISTS vote_count_by_candidate AS
+-- SELECT
+--   candidate_id,
+--   AS_VALUE(candidate_id) AS candidate_id_v,
+--   COUNT(*) AS total_votes
+-- FROM vote_events_valid_stream
+-- GROUP BY candidate_id
+-- EMIT CHANGES;
+--
+-- AS_VALUE(...) expose la clé de groupement dans la valeur JSON (utile pour le tableau de bord ou d’autres consommateurs).
+--
+-- À compléter : votre CREATE TABLE AS SELECT ... vote_count_by_candidate.
+
+-- =============================================================================
+-- TODO 4 : TABLE fenêtre 1 minute par ville + candidat
+-- =============================================================================
+-- Modèle :
+-- CREATE TABLE IF NOT EXISTS vote_count_by_city_minute
+-- WITH ( KEY_FORMAT='JSON' ) AS
+-- SELECT
+--   city_code,
+--   candidate_id,
+--   AS_VALUE(city_code) AS city_code_v,
+--   AS_VALUE(candidate_id) AS candidate_id_v,
+--   WINDOWSTART AS window_start,
+--   WINDOWEND AS window_end,
+--   COUNT(*) AS votes_in_minute
+-- FROM vote_events_valid_stream
+-- WINDOW TUMBLING (SIZE 1 MINUTE)
+-- GROUP BY city_code, candidate_id
+-- EMIT CHANGES;
+--
+-- Le topic Kafka dérivé s'appelle en général VOTE_COUNT_BY_CITY_MINUTE (majuscules) : ne pas le créer à la main.
+--
+-- À compléter : votre CREATE TABLE ... fenêtre 1 minute (vote_count_by_city_minute).
+
+-- =============================================================================
+-- TODO 5 : TABLE rejets par raison
+-- =============================================================================
+-- Modèle :
+-- CREATE TABLE IF NOT EXISTS rejected_by_reason AS
+-- SELECT
+--   error_reason,
+--   COUNT(*) AS rejected_count
+-- FROM vote_events_rejected_stream
+-- GROUP BY error_reason
+-- EMIT CHANGES;
+--
+-- À compléter : votre CREATE TABLE ... rejected_by_reason.
+
+-- =============================================================================
+-- TODO 6 : TABLE département × bloc (carte / entrepôt)
+-- =============================================================================
+-- Modèle :
+-- CREATE TABLE IF NOT EXISTS vote_count_by_dept_block
+-- WITH ( KEY_FORMAT='JSON' ) AS
+-- SELECT
+--   department_code,
+--   candidate_block,
+--   AS_VALUE(department_code) AS department_code_v,
+--   AS_VALUE(candidate_block) AS block_v,
+--   COUNT(*) AS total_votes
+-- FROM vote_events_valid_stream
+-- WHERE department_code IS NOT NULL AND candidate_block IS NOT NULL
+-- GROUP BY department_code, candidate_block
+-- EMIT CHANGES;
+--
+-- Topic dérivé : VOTE_COUNT_BY_DEPT_BLOCK (créé par ksqlDB, pas kafka-topics --create).
+-- Si la table est vide : vérifier le producteur (champs null) ou enlever le WHERE temporairement pour debug.
+--
+-- À compléter : votre CREATE TABLE ... vote_count_by_dept_block.
+
+-- =============================================================================
+-- TODO 7 : Vérification
+-- =============================================================================
+-- SHOW TABLES;
+-- SHOW QUERIES;
+-- SELECT * FROM vote_count_by_candidate LIMIT 20;
+-- SELECT * FROM vote_count_by_city_minute LIMIT 20;
+-- SELECT * FROM rejected_by_reason LIMIT 20;
+-- SELECT * FROM vote_count_by_dept_block LIMIT 20;
+--
+-- À exécuter en session ksqlDB (fichier ou interactif) : les requêtes ci-dessus pour contrôle (TODO 7).
