@@ -79,7 +79,7 @@ docker compose exec kafka kafka-topics --create --if-not-exists \ --topic vote_e
 docker compose exec kafka kafka-topics --list --bootstrap-server localhost:9092
 ```
 
-![Kafka Topics](screenshots/kafka_topics.png)
+![Kafka Topics](screenshots/proj1.png)
 
 ---
 
@@ -93,7 +93,7 @@ python enonce/src/producer_votes.py
 
 ### 📸 Résultat
 
-![Producer](screenshots/producer.png)
+![Producer](screenshots/proj2.png)
 
 ---
 
@@ -111,7 +111,7 @@ python enonce/src/validator_votes.py
 
 ### 📸 Résultat
 
-![Validator](screenshots/validator.png)
+![Validator](screenshots/proj3.png)
 
 ---
 
